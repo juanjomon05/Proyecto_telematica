@@ -1,6 +1,7 @@
 #ifndef PROTOCOL_H
 #define PROTOCOL_H
-
+#include <sys/socket.h>
+#include <string.h>
 #include <stdint.h>
 
 #define PAYLOAD_SIZE 64
@@ -59,3 +60,20 @@ typedef struct {
 } ErrorPayload;
 
 #endif
+
+// Envía un Message completo (66 bytes fijos) por el socket
+static inline int send_message(int sock, Message *msg) {
+    return send(sock, msg, sizeof(Message), 0);
+}
+
+// Recibe un Message completo (66 bytes fijos) del socket
+static inline int recv_message(int sock, Message *msg) {
+    return recv(sock, msg, sizeof(Message), 0);
+}
+
+// Arma un Message vacío con el tipo dado, listo para llenar payload
+static inline void init_message(Message *msg, uint8_t type, uint8_t seq) {
+    memset(msg, 0, sizeof(Message));
+    msg->type = type;
+    msg->seq = seq;
+}
