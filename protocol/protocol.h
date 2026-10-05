@@ -59,7 +59,6 @@ typedef struct {
     uint8_t error_code;
 } ErrorPayload;
 
-#endif
 
 // Envía un Message completo (66 bytes fijos) por el socket
 static inline int send_message(int sock, Message *msg) {
@@ -77,3 +76,4 @@ static inline void init_message(Message *msg, uint8_t type, uint8_t seq) {
     msg->type = type;
     msg->seq = seq;
 }
+#endif
