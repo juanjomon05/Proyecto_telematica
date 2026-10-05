@@ -1,3 +1,4 @@
 server/server
+client/test_client
 *.o
 log.txt
