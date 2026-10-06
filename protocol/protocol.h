@@ -13,6 +13,7 @@ typedef enum {
     MOVE_REQ      = 0x03,
     STATE_UPDATE  = 0x04,
     GAME_OVER     = 0x05,
+    GAME_START    = 0x06,
     MSG_ERROR     = 0xFF
 } MessageType;
 
@@ -58,6 +59,12 @@ typedef struct {
 typedef struct {
     uint8_t error_code;
 } ErrorPayload;
+
+// Payload de GAME_START
+typedef struct {
+    uint8_t slot;            // 1 o 2: que jugador eres
+    char opponent_nick[20];  // nickname del rival
+} GameStartPayload;
 
 
 // Envía un Message completo (66 bytes fijos) por el socket

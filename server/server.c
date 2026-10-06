@@ -8,53 +8,144 @@
 #include "../protocol/protocol.h"
 
 #define MAX_CLIENTES 20
+#define MAX_PARTIDAS (MAX_CLIENTES / 2)  // siempre alcanza para todos los clientes
 
 typedef struct {
-    uint8_t player_id;
+    int activo;
+    int fd;
     char nickname[20];
     char email[40];
-    int activo;
+    int partida_id;  // -1 si no esta en una partida
+    int slot;        // 1 o 2 dentro de la partida
 } Cliente;
 
-Cliente clientes[MAX_CLIENTES];
-int total_clientes = 0;
-pthread_mutex_t clientes_mutex = PTHREAD_MUTEX_INITIALIZER;
+typedef struct {
+    int activa;
+    int jugador[2];  // indices en clientes[]
+} Partida;
 
-void manejar_registro(int client_fd, Message *msg_in) {
+Cliente clientes[MAX_CLIENTES];
+Partida partidas[MAX_PARTIDAS];
+int en_espera = -1;  // indice del cliente que espera pareja, -1 si nadie
+pthread_mutex_t estado_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void enviar_error(int fd, uint8_t codigo) {
+    Message msg;
+    init_message(&msg, MSG_ERROR, 0);
+    ErrorPayload ep;
+    ep.error_code = codigo;  // 1 = servidor lleno, 2 = oponente desconectado
+    memcpy(msg.payload, &ep, sizeof(ep));
+    send_message(fd, &msg);
+}
+
+// Registra al cliente. Devuelve su id (indice en clientes[]) o -1 si no hay cupo.
+int registrar_cliente(int client_fd, Message *msg_in) {
     RegisterPayload reg;
-    memcpy(&reg, msg_in->payload, sizeof(RegisterPayload));
+    memcpy(&reg, msg_in->payload, sizeof(reg));
     reg.nickname[sizeof(reg.nickname) - 1] = '\0';
     reg.email[sizeof(reg.email) - 1] = '\0';
 
     printf("Registro recibido: nickname=%s, email=%s\n", reg.nickname, reg.email);
 
-    pthread_mutex_lock(&clientes_mutex);
-    if (total_clientes >= MAX_CLIENTES) {
-        pthread_mutex_unlock(&clientes_mutex);
-        Message err;
-        init_message(&err, MSG_ERROR, msg_in->seq);
-        ErrorPayload ep = { 1 }; // 1 = servidor lleno
-        memcpy(err.payload, &ep, sizeof(ep));
-        send_message(client_fd, &err);
-        printf("Registro rechazado: servidor lleno\n");
-        return;
+    pthread_mutex_lock(&estado_mutex);
+
+    int id = -1;
+    for (int i = 0; i < MAX_CLIENTES; i++) {
+        if (!clientes[i].activo) { id = i; break; }
     }
-    uint8_t nuevo_id = total_clientes;
-    clientes[total_clientes].player_id = nuevo_id;
-    strncpy(clientes[total_clientes].nickname, reg.nickname, sizeof(reg.nickname));
-    strncpy(clientes[total_clientes].email, reg.email, sizeof(reg.email));
-    clientes[total_clientes].activo = 1;
-    total_clientes++;
-    pthread_mutex_unlock(&clientes_mutex);
+
+    if (id == -1) {
+        enviar_error(client_fd, 1);
+        pthread_mutex_unlock(&estado_mutex);
+        printf("Registro rechazado: servidor lleno\n");
+        return -1;
+    }
+
+    memset(&clientes[id], 0, sizeof(Cliente));
+    clientes[id].activo = 1;
+    clientes[id].fd = client_fd;
+    clientes[id].partida_id = -1;
+    strncpy(clientes[id].nickname, reg.nickname, sizeof(clientes[id].nickname) - 1);
+    strncpy(clientes[id].email, reg.email, sizeof(clientes[id].email) - 1);
 
     Message msg_out;
     init_message(&msg_out, REGISTER_OK, msg_in->seq);
-    RegisterOkPayload ok_payload;
-    ok_payload.player_id = nuevo_id;
-    memcpy(msg_out.payload, &ok_payload, sizeof(RegisterOkPayload));
-
+    RegisterOkPayload ok;
+    ok.player_id = id;
+    memcpy(msg_out.payload, &ok, sizeof(ok));
     send_message(client_fd, &msg_out);
-    printf("Cliente registrado con player_id=%d\n", nuevo_id);
+
+    pthread_mutex_unlock(&estado_mutex);
+    printf("Cliente registrado con player_id=%d\n", id);
+    return id;
+}
+
+// Avisa a 'para' que empezo la partida y quien es su oponente.
+// Se llama con estado_mutex tomado.
+void enviar_game_start(int para, int oponente) {
+    Message msg;
+    init_message(&msg, GAME_START, 0);
+    GameStartPayload g;
+    memset(&g, 0, sizeof(g));
+    g.slot = clientes[para].slot;
+    strncpy(g.opponent_nick, clientes[oponente].nickname, sizeof(g.opponent_nick) - 1);
+    memcpy(msg.payload, &g, sizeof(g));
+    send_message(clientes[para].fd, &msg);
+}
+
+// Si hay alguien esperando, crea la partida; si no, el cliente queda en espera.
+void buscar_pareja(int id) {
+    pthread_mutex_lock(&estado_mutex);
+
+    if (en_espera == -1) {
+        en_espera = id;
+        printf("Cliente %d (%s) en espera de pareja\n", id, clientes[id].nickname);
+        pthread_mutex_unlock(&estado_mutex);
+        return;
+    }
+
+    int rival = en_espera;
+    en_espera = -1;
+
+    int p = 0;
+    while (partidas[p].activa) p++;  // siempre hay una libre (ver MAX_PARTIDAS)
+
+    partidas[p].activa = 1;
+    partidas[p].jugador[0] = rival;
+    partidas[p].jugador[1] = id;
+    clientes[rival].partida_id = p;
+    clientes[rival].slot = 1;
+    clientes[id].partida_id = p;
+    clientes[id].slot = 2;
+
+    printf("Partida %d creada: %s vs %s\n", p,
+           clientes[rival].nickname, clientes[id].nickname);
+
+    enviar_game_start(rival, id);
+    enviar_game_start(id, rival);
+
+    pthread_mutex_unlock(&estado_mutex);
+}
+
+// Libera al cliente y avisa a su rival si estaba en partida.
+// Se envia con el mutex tomado para que el fd del rival no se cierre mientras se le escribe.
+void desconectar_cliente(int id) {
+    pthread_mutex_lock(&estado_mutex);
+
+    if (en_espera == id) en_espera = -1;
+
+    int p = clientes[id].partida_id;
+    if (p >= 0 && partidas[p].activa) {
+        int rival = (partidas[p].jugador[0] == id) ? partidas[p].jugador[1]
+                                                   : partidas[p].jugador[0];
+        partidas[p].activa = 0;
+        clientes[rival].partida_id = -1;
+        enviar_error(clientes[rival].fd, 2);
+        printf("Partida %d terminada: %s se desconecto\n", p, clientes[id].nickname);
+    }
+
+    clientes[id].activo = 0;
+    pthread_mutex_unlock(&estado_mutex);
 }
 
 void *atender_cliente(void *arg) {
@@ -64,19 +155,30 @@ void *atender_cliente(void *arg) {
     printf("Hilo iniciado para cliente (fd=%d)\n", client_fd);
 
     Message msg_in;
-    int bytes = recv_message(client_fd, &msg_in);
-
-    if (bytes <= 0) {
-        printf("Cliente desconectado (fd=%d)\n", client_fd);
+    if (recv_message(client_fd, &msg_in) <= 0 || msg_in.type != REGISTER_REQ) {
+        printf("Cliente (fd=%d) no se registro, cerrando\n", client_fd);
         close(client_fd);
         return NULL;
     }
 
-    if (msg_in.type == REGISTER_REQ) {
-        manejar_registro(client_fd, &msg_in);
+    int id = registrar_cliente(client_fd, &msg_in);
+    if (id < 0) {
+        close(client_fd);
+        return NULL;
     }
 
-    // TODO: aqui va el loop del juego en vez de cerrar
+    buscar_pareja(id);
+
+    // Loop principal: el cliente sigue conectado mientras espera y mientras juega
+    while (recv_message(client_fd, &msg_in) > 0) {
+        if (msg_in.type == MOVE_REQ) {
+            printf("MOVE_REQ de cliente %d\n", id);
+            // TODO RF-10: procesar el movimiento
+        }
+    }
+
+    printf("Cliente %d desconectado\n", id);
+    desconectar_cliente(id);
     close(client_fd);
     return NULL;
 }
