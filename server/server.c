@@ -6,6 +6,7 @@
 #include <signal.h>
 #include <pthread.h>
 #include "../protocol/protocol.h"
+#include "logger.h"
 
 #define MAX_CLIENTES 20
 #define MAX_PARTIDAS (MAX_CLIENTES / 2)  // siempre alcanza para todos los clientes
@@ -45,7 +46,7 @@ int registrar_cliente(int client_fd, Message *msg_in) {
     reg.nickname[sizeof(reg.nickname) - 1] = '\0';
     reg.email[sizeof(reg.email) - 1] = '\0';
 
-    printf("Registro recibido: nickname=%s, email=%s\n", reg.nickname, reg.email);
+    log_msg("Registro recibido: nickname=%s, email=%s\n", reg.nickname, reg.email);
 
     pthread_mutex_lock(&estado_mutex);
 
@@ -57,7 +58,7 @@ int registrar_cliente(int client_fd, Message *msg_in) {
     if (id == -1) {
         enviar_error(client_fd, 1);
         pthread_mutex_unlock(&estado_mutex);
-        printf("Registro rechazado: servidor lleno\n");
+        log_msg("Registro rechazado: servidor lleno\n");
         return -1;
     }
 
@@ -76,7 +77,7 @@ int registrar_cliente(int client_fd, Message *msg_in) {
     send_message(client_fd, &msg_out);
 
     pthread_mutex_unlock(&estado_mutex);
-    printf("Cliente registrado con player_id=%d\n", id);
+    log_msg("Cliente registrado con player_id=%d\n", id);
     return id;
 }
 
@@ -99,7 +100,7 @@ void buscar_pareja(int id) {
 
     if (en_espera == -1) {
         en_espera = id;
-        printf("Cliente %d (%s) en espera de pareja\n", id, clientes[id].nickname);
+        log_msg("Cliente %d (%s) en espera de pareja\n", id, clientes[id].nickname);
         pthread_mutex_unlock(&estado_mutex);
         return;
     }
@@ -118,7 +119,7 @@ void buscar_pareja(int id) {
     clientes[id].partida_id = p;
     clientes[id].slot = 2;
 
-    printf("Partida %d creada: %s vs %s\n", p,
+    log_msg("Partida %d creada: %s vs %s\n", p,
            clientes[rival].nickname, clientes[id].nickname);
 
     enviar_game_start(rival, id);
@@ -141,7 +142,7 @@ void desconectar_cliente(int id) {
         partidas[p].activa = 0;
         clientes[rival].partida_id = -1;
         enviar_error(clientes[rival].fd, 2);
-        printf("Partida %d terminada: %s se desconecto\n", p, clientes[id].nickname);
+        log_msg("Partida %d terminada: %s se desconecto\n", p, clientes[id].nickname);
     }
 
     clientes[id].activo = 0;
@@ -152,11 +153,11 @@ void *atender_cliente(void *arg) {
     int client_fd = *(int *)arg;
     free(arg);
 
-    printf("Hilo iniciado para cliente (fd=%d)\n", client_fd);
+    log_msg("Hilo iniciado para cliente (fd=%d)\n", client_fd);
 
     Message msg_in;
     if (recv_message(client_fd, &msg_in) <= 0 || msg_in.type != REGISTER_REQ) {
-        printf("Cliente (fd=%d) no se registro, cerrando\n", client_fd);
+        log_msg("Cliente (fd=%d) no se registro, cerrando\n", client_fd);
         close(client_fd);
         return NULL;
     }
@@ -172,12 +173,12 @@ void *atender_cliente(void *arg) {
     // Loop principal: el cliente sigue conectado mientras espera y mientras juega
     while (recv_message(client_fd, &msg_in) > 0) {
         if (msg_in.type == MOVE_REQ) {
-            printf("MOVE_REQ de cliente %d\n", id);
+            log_msg("MOVE_REQ de cliente %d\n", id);
             // TODO RF-10: procesar el movimiento
         }
     }
 
-    printf("Cliente %d desconectado\n", id);
+    log_msg("Cliente %d desconectado\n", id);
     desconectar_cliente(id);
     close(client_fd);
     return NULL;
@@ -185,13 +186,14 @@ void *atender_cliente(void *arg) {
 
 int main(int argc, char *argv[]) {
     if (argc < 3) {
-        printf("Uso: %s <PORT> <LogFile>\n", argv[0]);
+        log_msg("Uso: %s <PORT> <LogFile>\n", argv[0]);
         exit(1);
     }
 
     signal(SIGPIPE, SIG_IGN);
 
     int port = atoi(argv[1]);
+    log_init(argv[2]);
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
@@ -218,7 +220,7 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    printf("Servidor escuchando en el puerto %d...\n", port);
+    log_msg("Servidor escuchando en el puerto %d...\n", port);
 
     while (1) {
         int *client_fd = malloc(sizeof(int));
@@ -230,7 +232,7 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        printf("Cliente conectado (fd=%d)\n", *client_fd);
+        log_msg("Cliente conectado (fd=%d)\n", *client_fd);
 
         pthread_t tid;
         pthread_create(&tid, NULL, atender_cliente, client_fd);
