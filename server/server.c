@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include "../protocol/protocol.h"
 #include "logger.h"
+#include "game.h"
 
 #define MAX_CLIENTES 20
 #define MAX_PARTIDAS (MAX_CLIENTES / 2)  // siempre alcanza para todos los clientes
@@ -22,7 +23,9 @@ typedef struct {
 
 typedef struct {
     int activa;
-    int jugador[2];  // indices en clientes[]
+    int hilo_activo;  // 1 mientras el hilo de la partida sigue corriendo
+    int jugador[2];   // indices en clientes[]
+    EstadoJuego juego;
 } Partida;
 
 Cliente clientes[MAX_CLIENTES];
@@ -94,6 +97,33 @@ void enviar_game_start(int para, int oponente) {
     send_message(clientes[para].fd, &msg);
 }
 
+// Hilo de cada partida: avanza el estado del juego un tick a la vez.
+void *hilo_partida(void *arg) {
+    int p = *(int *)arg;
+    free(arg);
+
+    pthread_mutex_lock(&estado_mutex);
+    while (partidas[p].activa) {
+        int anoto = juego_tick(&partidas[p].juego);
+        if (anoto) {
+            int ganador = partidas[p].jugador[anoto - 1];
+            log_msg("Partida %d: punto para %s, marcador %d-%d\n", p,
+                    clientes[ganador].nickname,
+                    partidas[p].juego.marcador[0], partidas[p].juego.marcador[1]);
+        }
+        // TODO: enviar STATE_UPDATE a ambos jugadores
+
+        pthread_mutex_unlock(&estado_mutex);
+        usleep(TICK_US);
+        pthread_mutex_lock(&estado_mutex);
+    }
+    partidas[p].hilo_activo = 0;
+    pthread_mutex_unlock(&estado_mutex);
+
+    log_msg("Hilo de partida %d terminado\n", p);
+    return NULL;
+}
+
 // Si hay alguien esperando, crea la partida; si no, el cliente queda en espera.
 void buscar_pareja(int id) {
     pthread_mutex_lock(&estado_mutex);
@@ -108,10 +138,13 @@ void buscar_pareja(int id) {
     int rival = en_espera;
     en_espera = -1;
 
+    // Se salta tambien la partida cuyo hilo aun no termina, para no tener dos hilos en ella
     int p = 0;
-    while (partidas[p].activa) p++;  // siempre hay una libre (ver MAX_PARTIDAS)
+    while (partidas[p].activa || partidas[p].hilo_activo) p++;  // siempre hay una libre (ver MAX_PARTIDAS)
 
     partidas[p].activa = 1;
+    partidas[p].hilo_activo = 1;
+    juego_iniciar(&partidas[p].juego);
     partidas[p].jugador[0] = rival;
     partidas[p].jugador[1] = id;
     clientes[rival].partida_id = p;
@@ -124,6 +157,12 @@ void buscar_pareja(int id) {
 
     enviar_game_start(rival, id);
     enviar_game_start(id, rival);
+
+    int *arg = malloc(sizeof(int));
+    *arg = p;
+    pthread_t tid;
+    pthread_create(&tid, NULL, hilo_partida, arg);
+    pthread_detach(tid);
 
     pthread_mutex_unlock(&estado_mutex);
 }
