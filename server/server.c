@@ -97,6 +97,28 @@ void enviar_game_start(int para, int oponente) {
     send_message(clientes[para].fd, &msg);
 }
 
+// Envia el estado actual de la partida p a sus dos jugadores.
+// Los int32 viajan en orden de red (big-endian). Se llama con estado_mutex tomado.
+void enviar_estado(int p) {
+    EstadoJuego *j = &partidas[p].juego;
+
+    Message msg;
+    init_message(&msg, STATE_UPDATE, 0);
+    StatePayload s;
+    memset(&s, 0, sizeof(s));
+    s.ball_x = htonl(j->pelota_x);
+    s.ball_y = htonl(j->pelota_y);
+    s.paddle1_y = htonl(j->paleta_y[0]);
+    s.paddle2_y = htonl(j->paleta_y[1]);
+    s.score1 = j->marcador[0];
+    s.score2 = j->marcador[1];
+    memcpy(msg.payload, &s, sizeof(s));
+
+    for (int i = 0; i < 2; i++) {
+        send_message(clientes[partidas[p].jugador[i]].fd, &msg);
+    }
+}
+
 // Hilo de cada partida: avanza el estado del juego un tick a la vez.
 void *hilo_partida(void *arg) {
     int p = *(int *)arg;
@@ -111,7 +133,7 @@ void *hilo_partida(void *arg) {
                     clientes[ganador].nickname,
                     partidas[p].juego.marcador[0], partidas[p].juego.marcador[1]);
         }
-        // TODO: enviar STATE_UPDATE a ambos jugadores
+        enviar_estado(p);
 
         pthread_mutex_unlock(&estado_mutex);
         usleep(TICK_US);
@@ -188,6 +210,32 @@ void desconectar_cliente(int id) {
     pthread_mutex_unlock(&estado_mutex);
 }
 
+// Fija la direccion de la paleta del cliente segun el MOVE_REQ recibido.
+// El hilo de la partida la aplica en el siguiente tick y envia el nuevo estado.
+void procesar_movimiento(int id, Message *msg_in) {
+    MovePayload mv;
+    memcpy(&mv, msg_in->payload, sizeof(mv));
+
+    if (mv.direction > 2) {
+        log_msg("MOVE_REQ de cliente %d con direccion invalida=%d, ignorado\n", id, mv.direction);
+        return;
+    }
+
+    // Protocolo: 0=arriba, 1=abajo, 2=quieto -> motor: -1, 1, 0 (y crece hacia abajo)
+    int dir = (mv.direction == 0) ? -1 : (mv.direction == 1) ? 1 : 0;
+
+    pthread_mutex_lock(&estado_mutex);
+    int p = clientes[id].partida_id;
+    if (p >= 0 && partidas[p].activa) {
+        partidas[p].juego.paleta_dir[clientes[id].slot - 1] = dir;
+        log_msg("MOVE_REQ de %s (jugador %d, partida %d): direccion=%d\n",
+                clientes[id].nickname, clientes[id].slot, p, mv.direction);
+    } else {
+        log_msg("MOVE_REQ de cliente %d sin partida activa, ignorado\n", id);
+    }
+    pthread_mutex_unlock(&estado_mutex);
+}
+
 void *atender_cliente(void *arg) {
     int client_fd = *(int *)arg;
     free(arg);
@@ -212,8 +260,7 @@ void *atender_cliente(void *arg) {
     // Loop principal: el cliente sigue conectado mientras espera y mientras juega
     while (recv_message(client_fd, &msg_in) > 0) {
         if (msg_in.type == MOVE_REQ) {
-            log_msg("MOVE_REQ de cliente %d\n", id);
-            // TODO RF-10: procesar el movimiento
+            procesar_movimiento(id, &msg_in);
         }
     }
 

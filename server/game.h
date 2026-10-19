@@ -24,7 +24,7 @@ typedef struct {
     int pelota_x, pelota_y;
     int vel_x, vel_y;
     int paleta_y[2];    // [0] = jugador 1 (izquierda), [1] = jugador 2 (derecha)
-    int paleta_dir[2];  // -1 = arriba, 0 = quieto, 1 = abajo (lo fija RF-10)
+    int paleta_dir[2];  // -1 = arriba, 0 = quieto, 1 = abajo (lo fija cada MOVE_REQ)
     int marcador[2];
 } EstadoJuego;
 

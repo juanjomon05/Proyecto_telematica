@@ -72,9 +72,10 @@ static inline int send_message(int sock, Message *msg) {
     return send(sock, msg, sizeof(Message), 0);
 }
 
-// Recibe un Message completo (66 bytes fijos) del socket
+// Recibe un Message completo (66 bytes fijos) del socket.
+// MSG_WAITALL: TCP es un flujo y puede entregar un mensaje partido; asi recv espera los 66 bytes.
 static inline int recv_message(int sock, Message *msg) {
-    return recv(sock, msg, sizeof(Message), 0);
+    return recv(sock, msg, sizeof(Message), MSG_WAITALL);
 }
 
 // Arma un Message vacío con el tipo dado, listo para llenar payload
