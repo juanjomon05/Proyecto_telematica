@@ -15,8 +15,17 @@ REGISTER_REQ = 0x01
 REGISTER_OK = 0x02
 MOVE_REQ = 0x03
 STATE_UPDATE = 0x04
+GAME_OVER = 0x05
 GAME_START = 0x06
 MSG_ERROR = 0xFF
+
+# Codigos de MSG_ERROR (protocol.h)
+ERRORES = {
+    1: "el servidor esta lleno",
+    2: "el oponente se desconecto",
+    3: "nickname vacio o email invalido",
+    4: "ese nickname ya esta en uso",
+}
 
 MSG_SIZE = 66  # type(1) + seq(1) + payload(64)
 
@@ -83,10 +92,16 @@ def hilo_red(sock, estado):
                 estado.pelota = (bx, by)
                 estado.paletas = [p1, p2]
                 estado.score = (s1, s2)
+            elif tipo == GAME_OVER:
+                ganador = payload[0]
+                estado.texto = ("Ganaste!" if ganador == estado.slot
+                                else f"Gano el jugador {ganador}")
+                estado.jugando = False
+                estado.terminado = True
+                return
             elif tipo == MSG_ERROR:
                 codigo = payload[0]
-                estado.texto = ("El oponente se desconecto" if codigo == 2
-                                else f"ERROR del servidor, codigo={codigo}")
+                estado.texto = ERRORES.get(codigo, f"ERROR del servidor, codigo={codigo}")
                 estado.jugando = False
                 estado.terminado = True
                 return
@@ -107,7 +122,8 @@ def main():
     sock.sendall(empaquetar(REGISTER_REQ, 1, reg))
     msg = recibir_mensaje(sock)
     if msg is None or msg[0] != REGISTER_OK:
-        print("Registro fallido")
+        motivo = ERRORES.get(msg[1][0], "") if msg and msg[0] == MSG_ERROR else ""
+        print("Registro fallido" + (f": {motivo}" if motivo else ""))
         sock.close()
         sys.exit(1)
 
@@ -145,7 +161,10 @@ def main():
             else:
                 direccion = QUIETO
             if direccion != ultima_dir:
-                sock.sendall(empaquetar(MOVE_REQ, 0, bytes([direccion])))
+                try:
+                    sock.sendall(empaquetar(MOVE_REQ, 0, bytes([direccion])))
+                except OSError:  # el servidor ya cerro la conexion; el hilo de red lo avisa
+                    pass
                 ultima_dir = direccion
 
         pantalla.fill((0, 0, 0))
@@ -167,6 +186,9 @@ def main():
         if not jugando:
             aviso = fuente.render(texto, True, (255, 200, 0))
             pantalla.blit(aviso, (CAMPO_ANCHO // 2 - aviso.get_width() // 2, CAMPO_ALTO // 2 - 60))
+            if terminado:
+                cierre = fuente.render("Cierra la ventana para salir", True, (150, 150, 150))
+                pantalla.blit(cierre, (CAMPO_ANCHO // 2 - cierre.get_width() // 2, CAMPO_ALTO // 2 - 20))
 
         pygame.display.flip()
         reloj.tick(60)

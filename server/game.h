@@ -15,6 +15,7 @@
 #define PELOTA_TAM     10
 #define PELOTA_VEL     5    // pixeles por tick en cada eje
 #define TICK_US        16666  // ~60 ticks por segundo
+#define PUNTOS_VICTORIA 5     // gana quien llegue primero a estos puntos
 
 // Borde x de la cara de cada paleta que mira hacia el centro
 #define PALETA1_X_FRENTE (PALETA_MARGEN + PALETA_ANCHO)

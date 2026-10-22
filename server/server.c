@@ -5,6 +5,9 @@
 #include <arpa/inet.h>
 #include <signal.h>
 #include <pthread.h>
+#include <sys/time.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include "../protocol/protocol.h"
 #include "logger.h"
 #include "game.h"
@@ -26,6 +29,8 @@ typedef struct {
     int hilo_activo;  // 1 mientras el hilo de la partida sigue corriendo
     int jugador[2];   // indices en clientes[]
     EstadoJuego juego;
+    uint8_t seq;      // contador de STATE_UPDATE de esta partida (da la vuelta en 255)
+    unsigned ticks;   // ticks transcurridos, para no inundar el log con cada STATE_UPDATE
 } Partida;
 
 Cliente clientes[MAX_CLIENTES];
@@ -37,9 +42,10 @@ void enviar_error(int fd, uint8_t codigo) {
     Message msg;
     init_message(&msg, MSG_ERROR, 0);
     ErrorPayload ep;
-    ep.error_code = codigo;  // 1 = servidor lleno, 2 = oponente desconectado
+    ep.error_code = codigo;  // ver ErrorCode en protocol.h
     memcpy(msg.payload, &ep, sizeof(ep));
     send_message(fd, &msg);
+    log_msg("Respuesta MSG_ERROR enviada (fd=%d): codigo=%d\n", fd, codigo);
 }
 
 // Registra al cliente. Devuelve su id (indice en clientes[]) o -1 si no hay cupo.
@@ -49,17 +55,29 @@ int registrar_cliente(int client_fd, Message *msg_in) {
     reg.nickname[sizeof(reg.nickname) - 1] = '\0';
     reg.email[sizeof(reg.email) - 1] = '\0';
 
-    log_msg("Registro recibido: nickname=%s, email=%s\n", reg.nickname, reg.email);
+    log_msg("Peticion REGISTER_REQ recibida: nickname=%s, email=%s\n", reg.nickname, reg.email);
+
+    if (reg.nickname[0] == '\0' || strchr(reg.email, '@') == NULL) {
+        enviar_error(client_fd, ERR_DATOS_INVALIDOS);
+        log_msg("Registro rechazado: nickname vacio o email invalido\n");
+        return -1;
+    }
 
     pthread_mutex_lock(&estado_mutex);
 
     int id = -1;
     for (int i = 0; i < MAX_CLIENTES; i++) {
-        if (!clientes[i].activo) { id = i; break; }
+        if (clientes[i].activo && strcmp(clientes[i].nickname, reg.nickname) == 0) {
+            enviar_error(client_fd, ERR_NICK_EN_USO);
+            pthread_mutex_unlock(&estado_mutex);
+            log_msg("Registro rechazado: nickname '%s' en uso\n", reg.nickname);
+            return -1;
+        }
+        if (id == -1 && !clientes[i].activo) id = i;
     }
 
     if (id == -1) {
-        enviar_error(client_fd, 1);
+        enviar_error(client_fd, ERR_SERVIDOR_LLENO);
         pthread_mutex_unlock(&estado_mutex);
         log_msg("Registro rechazado: servidor lleno\n");
         return -1;
@@ -80,7 +98,7 @@ int registrar_cliente(int client_fd, Message *msg_in) {
     send_message(client_fd, &msg_out);
 
     pthread_mutex_unlock(&estado_mutex);
-    log_msg("Cliente registrado con player_id=%d\n", id);
+    log_msg("Respuesta REGISTER_OK enviada: player_id=%d\n", id);
     return id;
 }
 
@@ -95,6 +113,8 @@ void enviar_game_start(int para, int oponente) {
     strncpy(g.opponent_nick, clientes[oponente].nickname, sizeof(g.opponent_nick) - 1);
     memcpy(msg.payload, &g, sizeof(g));
     send_message(clientes[para].fd, &msg);
+    log_msg("Respuesta GAME_START enviada a %s: slot=%d, oponente=%s\n",
+            clientes[para].nickname, g.slot, g.opponent_nick);
 }
 
 // Envia el estado actual de la partida p a sus dos jugadores.
@@ -103,7 +123,7 @@ void enviar_estado(int p) {
     EstadoJuego *j = &partidas[p].juego;
 
     Message msg;
-    init_message(&msg, STATE_UPDATE, 0);
+    init_message(&msg, STATE_UPDATE, partidas[p].seq++);
     StatePayload s;
     memset(&s, 0, sizeof(s));
     s.ball_x = htonl(j->pelota_x);
@@ -117,6 +137,34 @@ void enviar_estado(int p) {
     for (int i = 0; i < 2; i++) {
         send_message(clientes[partidas[p].jugador[i]].fd, &msg);
     }
+
+    // A ~60 STATE_UPDATE por segundo, se registra solo uno por segundo (el resto se envia igual)
+    if (partidas[p].ticks++ % 60 == 0) {
+        log_msg("Respuesta STATE_UPDATE enviada (partida %d, seq=%u): pelota=(%d,%d) paletas=%d,%d marcador=%d-%d\n",
+                p, msg.seq, j->pelota_x, j->pelota_y, j->paleta_y[0], j->paleta_y[1],
+                j->marcador[0], j->marcador[1]);
+    }
+}
+
+// Avisa a los dos jugadores quien gano y deja la partida libre.
+// ganador_slot es 1 o 2. Se llama con estado_mutex tomado.
+void terminar_partida(int p, int ganador_slot) {
+    Message msg;
+    init_message(&msg, GAME_OVER, 0);
+    GameOverPayload go;
+    go.winner_id = ganador_slot;
+    memcpy(msg.payload, &go, sizeof(go));
+
+    for (int i = 0; i < 2; i++) {
+        int c = partidas[p].jugador[i];
+        send_message(clientes[c].fd, &msg);
+        clientes[c].partida_id = -1;  // evita que una desconexion posterior toque otra partida
+    }
+
+    partidas[p].activa = 0;
+    log_msg("Respuesta GAME_OVER enviada (partida %d): gana %s con marcador %d-%d\n", p,
+            clientes[partidas[p].jugador[ganador_slot - 1]].nickname,
+            partidas[p].juego.marcador[0], partidas[p].juego.marcador[1]);
 }
 
 // Hilo de cada partida: avanza el estado del juego un tick a la vez.
@@ -134,6 +182,11 @@ void *hilo_partida(void *arg) {
                     partidas[p].juego.marcador[0], partidas[p].juego.marcador[1]);
         }
         enviar_estado(p);
+
+        if (anoto && partidas[p].juego.marcador[anoto - 1] >= PUNTOS_VICTORIA) {
+            terminar_partida(p, anoto);
+            break;
+        }
 
         pthread_mutex_unlock(&estado_mutex);
         usleep(TICK_US);
@@ -166,6 +219,8 @@ void buscar_pareja(int id) {
 
     partidas[p].activa = 1;
     partidas[p].hilo_activo = 1;
+    partidas[p].seq = 0;
+    partidas[p].ticks = 0;
     juego_iniciar(&partidas[p].juego);
     partidas[p].jugador[0] = rival;
     partidas[p].jugador[1] = id;
@@ -202,7 +257,7 @@ void desconectar_cliente(int id) {
                                                    : partidas[p].jugador[0];
         partidas[p].activa = 0;
         clientes[rival].partida_id = -1;
-        enviar_error(clientes[rival].fd, 2);
+        enviar_error(clientes[rival].fd, ERR_OPONENTE_DESCONECTADO);
         log_msg("Partida %d terminada: %s se desconecto\n", p, clientes[id].nickname);
     }
 
@@ -319,6 +374,14 @@ int main(int argc, char *argv[]) {
         }
 
         log_msg("Cliente conectado (fd=%d)\n", *client_fd);
+
+        // Mensajes pequenos y frecuentes: sin TCP_NODELAY el algoritmo de Nagle agrega latencia.
+        int nodelay = 1;
+        setsockopt(*client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+        // Los envios se hacen con el mutex tomado: si un cliente no lee, send() no debe
+        // bloquear para siempre a las demas partidas.
+        struct timeval tv = { 2, 0 };
+        setsockopt(*client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
         pthread_t tid;
         pthread_create(&tid, NULL, atender_cliente, client_fd);
